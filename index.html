@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simulador de C99</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Simulador de C99</h1>
+        </header>
+        
+        <div class="main-content">
+            <div class="code-container">
+                <h2>Código C</h2>
+                
+                <!-- Indicador de linha atual de execução -->
+                <div id="line-indicator" class="line-indicator">
+                    <div class="line-number">Linha: <span id="current-line-number">-</span></div>
+                    <div class="line-context" id="current-line-context">Nenhuma execução em andamento</div>
+                </div>
+                
+                <textarea id="c-code" placeholder="Digite seu código C99 aqui...">
+// Exemplo de código
+#include <stdio.h>
+
+int fatorial(int n) {
+    if (n <= 1) {
+        return 1;
+    }
+    return n * fatorial(n - 1);
+}
+
+int main() {
+    int n = 5;
+    int *ptr = &n;
+    int resultado = fatorial(n);
+    printf("Fatorial de %d é %d\n", n, resultado);
+    return 0;
+}
+</textarea>
+                <div class="button-container">
+                    <button id="run-button">Executar</button>
+                    <button id="step-button">Passo a Passo</button>
+                    <button id="reset-button">Reiniciar</button>
+                </div>
+            </div>
+            
+            <div class="visualization-container">
+                <div class="output-container">
+                    <h2>Saída</h2>
+                    <div id="output"></div>
+                </div>
+                
+                <div class="memory-container">
+                    <h2>Memória</h2>
+                    <div id="memory-view"></div>
+                </div>
+                
+                <div class="stack-container">
+                    <h2>Pilha de Recursão</h2>
+                    <div id="stack-view"></div>
+                </div>
+            </div>
+        </div>
+        
+        <footer>
+            <p>Simulador de C99 - Visualização de memória, pilha e ponteiros</p>
+        </footer>
+    </div>
+
+    <script src="js/parser.js"></script>
+    <script src="js/memory.js"></script>
+    <script src="js/execution.js"></script>
+    <script src="js/visualization.js"></script>
+    <script src="js/main.js"></script>
+</body>
+</html>
