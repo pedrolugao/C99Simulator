@@ -98,7 +98,81 @@ class CParser {
         let lines = bodyString.split(';').map(line => line.trim()).filter(line => line);
         
         for (const line of lines) {
-            // Declaração de variável
+            // Array declaration parsing
+            // int arr[10]; char name[20]; float values[SIZE]; int arr[] = {1,2,3}; char str[] = "hello";
+            const arrayDeclRegex = /^(int|char|float|double)\s+(\w+)\s*\[\s*(\w*)\s*\](?:\s*=\s*(.+))?$/;
+            const arrayMatch = arrayDeclRegex.exec(line);
+
+            if (arrayMatch) {
+                const varType = arrayMatch[1];
+                const name = arrayMatch[2];
+                const sizeFromDecl = arrayMatch[3]; // Can be empty, a number string, or a symbolic string
+                const rawInitializer = arrayMatch[4];
+                
+                let finalSize = null;
+                let initialValue = null;
+
+                // Determine initial size based on declaration (e.g., "10" or "SIZE")
+                if (sizeFromDecl) {
+                    const num = parseInt(sizeFromDecl, 10);
+                    if (!isNaN(num)) {
+                        finalSize = num;
+                    } else {
+                        finalSize = sizeFromDecl; // Symbolic size like 'SIZE'
+                    }
+                } // If sizeFromDecl is empty, finalSize remains null for now.
+
+                if (rawInitializer) {
+                    if (rawInitializer.startsWith('{') && rawInitializer.endsWith('}')) {
+                        // Initializer list: e.g., {1, 2, 3}
+                        const listContent = rawInitializer.substring(1, rawInitializer.length - 1).trim();
+                        if (listContent) {
+                            initialValue = listContent.split(',').map(item => {
+                                item = item.trim();
+                                // Attempt to convert to number, otherwise keep as string (for potential symbols)
+                                return isNaN(Number(item)) ? item : Number(item);
+                            });
+                        } else {
+                            initialValue = []; // Empty initializer list e.g. {}
+                        }
+                        if (sizeFromDecl === '') { // Infer size: int arr[] = {1,2,3};
+                            finalSize = initialValue.length;
+                        }
+                    } else if (varType === 'char' && rawInitializer.startsWith('"') && rawInitializer.endsWith('"')) {
+                        // String literal for char array: e.g., "hello"
+                        initialValue = rawInitializer; // Keep the quotes as per requirement "hello"
+                        if (sizeFromDecl === '') { // Infer size: char str[] = "hello";
+                            finalSize = rawInitializer.length - 2 + 1; // string content length + null terminator
+                        }
+                    } else {
+                        // Other types of initializers (e.g., single value for non-char array, or complex expression)
+                        // For now, store as is. This part might need more specific handling for non-char arrays if not an initializer list.
+                        initialValue = rawInitializer;
+                        // If it's a simple variable assigned to an array element (e.g. int x = arr[0]), this regex won't catch it.
+                        // This path is more for `int arr[5] = x;` which is not standard C for full array init.
+                        // However, the regex `(?:\s*=\s*(.+))?$` captures the RHS broadly.
+                        // If sizeFromDecl was empty, finalSize would still be null here, which is an issue if type != char
+                        // e.g. int arr[] = x; -> size remains null. This is complex.
+                        // Let's assume for now that non-char arrays without explicit size must use {} or not be handled by this initializer block.
+                        // The problem description focuses on {} and "" for initializers.
+                    }
+                }
+                
+                // finalSize can be: a number, a symbolic string, or null (if not specified and not inferable)
+                const dimensions = finalSize !== null ? [finalSize] : [null];
+
+                body.push({
+                    type: 'array_declaration',
+                    varType: varType,
+                    name: name,
+                    size: finalSize, 
+                    dimensions: dimensions,
+                    initialValue: initialValue
+                });
+                continue;
+            }
+
+            // Declaração de variável (simple)
             const varDeclRegex = /^(int|char|float|double)\s+(\*?)\s*(\w+)(?:\s*=\s*(.+))?$/;
             const varMatch = varDeclRegex.exec(line);
             
@@ -115,6 +189,46 @@ class CParser {
                     initialValue
                 });
                 
+                continue;
+            }
+
+            // Controle de fluxo - for loop
+            // Regex captures: 1=initialization, 2=condition, 3=increment, 4=body
+            const forRegex = /^for\s*\(([^;]*);([^;]*);([^)]*)\)\s*{([^{}]*(?:{[^{}]*(?:{[^{}]*}[^{}]*)*}[^{}]*)*)}$/;
+            const forMatch = forRegex.exec(line);
+
+            if (forMatch) {
+                const initialization = forMatch[1].trim();
+                const condition = forMatch[2].trim();
+                const increment = forMatch[3].trim();
+                const bodyContent = forMatch[4];
+                const loopBody = this.parseBody(bodyContent); // Recursively parse the loop's body
+
+                body.push({
+                    type: 'for_loop',
+                    initialization: initialization,
+                    condition: condition,
+                    increment: increment,
+                    body: loopBody
+                });
+                continue;
+            }
+            
+            // Controle de fluxo - while loop
+            // Regex captures: 1=condition, 2=body
+            const whileRegex = /^while\s*\((.+?)\)\s*{([^{}]*(?:{[^{}]*(?:{[^{}]*}[^{}]*)*}[^{}]*)*)}$/;
+            const whileMatch = whileRegex.exec(line);
+
+            if (whileMatch) {
+                const condition = whileMatch[1].trim();
+                const bodyContent = whileMatch[2];
+                const loopBody = this.parseBody(bodyContent); // Recursively parse the loop's body
+
+                body.push({
+                    type: 'while_loop',
+                    condition: condition,
+                    body: loopBody
+                });
                 continue;
             }
             
@@ -262,21 +376,62 @@ class CParser {
      * @returns {Array} Tokens da expressão
      */
     parseExpression(expr) {
-        // Se a expressão contiver uma chamada de função, preservamos como está
-        if (expr.match(/\w+\s*\(/)) {
-            return [expr];
+        const tokens = [];
+        const arrayAccessRegex = /^(\w+)\s*\[([^\]]+)\]/;
+        const identifierRegex = /^[a-zA-Z_]\w*/;
+        const numberRegex = /^\d+\.?\d*|^\.\d+/;
+        // Extended operators: includes parentheses, comma for function args if needed later
+        const operatorRegex = /^(\*\*|\*|\/|%|\+|-|<=|>=|==|!=|<|>|&&|\|\||\(|\)|=|,)/; // Added '=' for general expressions, '(' ')'
+        const stringLiteralRegex = /^"[^"]*"|^'[^']*'/;
+
+        let remainingExpr = expr.trim();
+
+        while (remainingExpr.length > 0) {
+            let match;
+
+            // 1. Array Access
+            if ((match = arrayAccessRegex.exec(remainingExpr))) {
+                tokens.push({
+                    type: "array_access",
+                    name: match[1],
+                    indexExpression: match[2].trim() // Store the inner expression string
+                });
+                remainingExpr = remainingExpr.substring(match[0].length).trim();
+            }
+            // 2. String Literals
+            else if ((match = stringLiteralRegex.exec(remainingExpr))) {
+                tokens.push(match[0]); // Push the full string literal with quotes
+                remainingExpr = remainingExpr.substring(match[0].length).trim();
+            }
+            // 3. Identifiers (must come after array access)
+            else if ((match = identifierRegex.exec(remainingExpr))) {
+                tokens.push(match[0]);
+                remainingExpr = remainingExpr.substring(match[0].length).trim();
+            }
+            // 4. Numbers
+            else if ((match = numberRegex.exec(remainingExpr))) {
+                tokens.push(parseFloat(match[0])); // Store as number
+                remainingExpr = remainingExpr.substring(match[0].length).trim();
+            }
+            // 5. Operators
+            else if ((match = operatorRegex.exec(remainingExpr))) {
+                tokens.push(match[0]);
+                remainingExpr = remainingExpr.substring(match[0].length).trim();
+            }
+            // 6. Whitespace (if any remains, skip)
+            else if (remainingExpr.match(/^\s+/)) {
+                remainingExpr = remainingExpr.replace(/^\s+/, '');
+            }
+            // Error: unrecognized token
+            else {
+                // Store the problematic part as an 'unknown' token or throw error
+                const unknownToken = remainingExpr.split(/\s|[(),;]/)[0] || remainingExpr;
+                tokens.push({ type: 'unknown_expression_token', value: unknownToken });
+                console.error(`CParser.parseExpression: Unrecognized token starting with: ${unknownToken} in expression ${expr}`);
+                remainingExpr = remainingExpr.substring(unknownToken.length).trim();
+            }
         }
-        
-        // Uma abordagem simplificada: divide a expressão em tokens
-        // Primeiro separamos operadores
-        const operators = ['\\+', '-', '\\*', '/', '%', '<=', '>=', '==', '!=', '<', '>', '&&', '\\|\\|'];
-        const operatorRegex = new RegExp(`(${operators.join('|')})`, 'g');
-        
-        // Substituímos operadores por espaço+operador+espaço para facilitar o split
-        const normalized = expr.replace(operatorRegex, ' $1 ');
-        
-        // Dividimos por espaço e filtramos tokens vazios
-        return normalized.split(/\s+/).filter(token => token);
+        return tokens;
     }
 }
 
