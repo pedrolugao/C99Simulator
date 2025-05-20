@@ -126,14 +126,33 @@ class CVisualizer {
             }
             
             // Adiciona cada item de memória
-            items.forEach(item => {
+            // let previousItemArrayName = null; // Not needed due to sorting and direct check
+            items.forEach((item, idx) => { // Added idx for checking previous item
                 const memoryCell = document.createElement('div');
                 memoryCell.className = 'memory-cell';
-                memoryCell.dataset.address = item.address;
+                memoryCell.dataset.address = item.address; // Crucial for pointer connections
                 
                 // Se o escopo da variável pertence a uma função completada, marca célula
                 if (this.completedFunctions.has(item.scope)) {
                     memoryCell.classList.add('cell-completed');
+                }
+
+                // Add specific classes for array elements
+                if (item.isArrayElement) {
+                    memoryCell.classList.add('array-element');
+                    if (item.arrayName) { // Ensure arrayName exists
+                        memoryCell.classList.add(`array-owner-${item.arrayName}`);
+                    }
+
+                    // Check if this is the first element of its array group within this scope.
+                    // Relies on the snapshot being sorted by scope, then arrayName, then elementIndex.
+                    const isFirstInGroup = (idx === 0 || 
+                                           !items[idx-1].isArrayElement || // Previous item was not an array element
+                                           items[idx-1].arrayName !== item.arrayName); // Previous item belonged to a different array
+                    
+                    if (isFirstInGroup) {
+                        memoryCell.classList.add('first-array-element');
+                    }
                 }
                 
                 // Endereço

@@ -102,6 +102,102 @@ class CExecutor {
                         visited: false
                     });
                 }
+            } else if (instruction.type === 'while_loop') {
+                const conditionCheckMarkerIndex = this.executionStack.length;
+                this.executionStack.push({
+                    function: functionName,
+                    instruction: {
+                        type: 'while_condition_check',
+                        condition: instruction.condition,
+                        loopBodyStartIndex: conditionCheckMarkerIndex + 1, // Instruction after this marker
+                        loopEndMarkerIndex: -1, // Placeholder, will be updated later
+                        originalInstruction: instruction // For line highlighting
+                    },
+                    visited: false
+                });
+
+                // Flatten the loop body
+                this.flattenInstructions(functionName, instruction.body);
+
+                // Now we know where the loop body ends and the 'while_loop_end' marker will be placed
+                const loopEndMarkerActualIndex = this.executionStack.length;
+                
+                // Update the placeholder in the 'while_condition_check' marker
+                if (conditionCheckMarkerIndex < this.executionStack.length) { // Ensure marker is still there
+                   this.executionStack[conditionCheckMarkerIndex].instruction.loopEndMarkerIndex = loopEndMarkerActualIndex;
+                }
+
+                this.executionStack.push({
+                    function: functionName,
+                    instruction: {
+                        type: 'while_loop_end',
+                        conditionCheckMarkerIndex: conditionCheckMarkerIndex,
+                        originalInstruction: instruction // For line highlighting
+                    },
+                    visited: false
+                });
+            } else if (instruction.type === 'for_loop') {
+                // 1. Flatten Initialization Statement (if any)
+                if (instruction.initialization && instruction.initialization.trim() !== '') {
+                    // The parser stores init, cond, incr as strings.
+                    // We need to parse the init string into AST statement(s).
+                    // parseBody expects a block of statements, so add a semicolon if not present.
+                    let initString = instruction.initialization;
+                    if (!initString.endsWith(';')) {
+                        initString += ';';
+                    }
+                    const initAstStatements = this.parser.parseBody(initString);
+                    if (initAstStatements && initAstStatements.length > 0) {
+                        // Flatten these initialization statements. They will be executed once.
+                        this.flattenInstructions(functionName, initAstStatements);
+                    }
+                }
+
+                // 2. Condition Check Marker
+                const conditionCheckMarkerIndex = this.executionStack.length;
+                this.executionStack.push({
+                    function: functionName,
+                    instruction: {
+                        type: 'for_condition_check',
+                        condition: instruction.condition, // Condition string
+                        incrementStatementString: instruction.increment, // Increment string
+                        // loopBodyStartIndex is implicitly conditionCheckMarkerIndex + 1
+                        loopEndMarkerIndex: -1, // Placeholder, updated later
+                        originalAstNode: instruction // For line highlighting
+                    },
+                    visited: false
+                });
+
+                // 3. Flatten Loop Body
+                this.flattenInstructions(functionName, instruction.body);
+
+                // 4. Increment Execution Marker
+                this.executionStack.push({
+                    function: functionName,
+                    instruction: {
+                        type: 'for_increment_execute',
+                        incrementStatementString: instruction.increment,
+                        originalAstNode: instruction // Highlight the for loop line during increment
+                    },
+                    visited: false
+                });
+                
+                // 5. Loop End Marker and Update Placeholder
+                const loopEndMarkerActualIndex = this.executionStack.length;
+                // Update placeholder in 'for_condition_check' marker
+                if(conditionCheckMarkerIndex < this.executionStack.length) { // Should always be true
+                    this.executionStack[conditionCheckMarkerIndex].instruction.loopEndMarkerIndex = loopEndMarkerActualIndex;
+                }
+
+                this.executionStack.push({
+                    function: functionName,
+                    instruction: {
+                        type: 'for_loop_end',
+                        conditionCheckMarkerIndex: conditionCheckMarkerIndex,
+                        originalAstNode: instruction // For line highlighting
+                    },
+                    visited: false
+                });
             }
         }
     }
@@ -218,6 +314,26 @@ class CExecutor {
             case 'else_end':
                 // Instruções de controle, não fazem nada diretamente
                 break;
+
+            case 'while_condition_check':
+                this.executeWhileConditionCheck(instruction, functionName);
+                break;
+
+            case 'while_loop_end':
+                this.executeWhileLoopEnd(instruction, functionName);
+                break;
+
+            case 'for_condition_check':
+                this.executeForConditionCheck(instruction, functionName);
+                break;
+
+            case 'for_increment_execute':
+                this.executeForIncrement(instruction, functionName);
+                break;
+
+            case 'for_loop_end':
+                this.executeForLoopEnd(instruction, functionName);
+                break;
                 
             case 'function_end':
                 // Marca explicitamente a transição de volta para a função chamadora
@@ -235,16 +351,19 @@ class CExecutor {
      * @param {string} functionName - Nome da função atual
      */
     executeVariableDeclaration(instruction, functionName) {
-        const { name, varType, initialValue } = instruction;
+        const { name, varType, initialValue, type } = instruction; // type is 'variable_declaration' or 'array_declaration'
         
-        // Para variáveis locais, usa o escopo da função
         const scope = functionName === 'global' ? 'global' : functionName;
-        
-        // Declara a variável na memória
-        const address = this.memory.declareVariable(name, varType, initialValue, scope);
-        
-        // Se for uma variável local, adiciona ao frame atual
-        if (scope !== 'global') {
+        let address;
+
+        if (instruction.type === 'array_declaration') { // AST node for array
+            // Pass the whole instruction object which matches the array AST node structure
+            address = this.memory.declareVariable(name, instruction, null, scope);
+        } else { // Simple variable
+            address = this.memory.declareVariable(name, varType, initialValue, scope);
+        }
+                
+        if (scope !== 'global' && address !== undefined) {
             const currentFrame = this.memory.getCurrentFrame();
             if (currentFrame) {
                 currentFrame.variables.set(name, address);
@@ -264,21 +383,46 @@ class CExecutor {
      * @param {string} functionName - Nome da função atual
      */
     executeAssignment(instruction, functionName) {
-        const { name, value } = instruction;
+        const { name, value } = instruction; // 'name' can be a string or an array_access object
         const scope = functionName === 'global' ? 'global' : functionName;
         
-        let evaluatedValue = value;
-        
-        // Se for um operador de endereço
-        if (value.startsWith('&')) {
-            evaluatedValue = value; // Mantém como está para processamento pelo memory.setVariable
+        const evaluatedRhsValue = this.evaluateExpression(value, scope);
+
+        if (typeof name === 'object' && name.type === 'array_access') {
+            const arrayName = name.name;
+            const indexExpression = name.indexExpression;
+
+            const arrayInfo = this.memory.getVariableInfo(arrayName, scope);
+            if (!arrayInfo || arrayInfo.type !== 'array') {
+                this.output.push(`Erro: '${arrayName}' não é um array ou não foi declarado no escopo '${scope}'.`);
+                console.error(`Erro: '${arrayName}' não é um array ou não foi declarado. arrayInfo:`, arrayInfo);
+                this.isRunning = false;
+                return;
+            }
+
+            const indexValue = this.evaluateExpression(indexExpression, scope);
+            if (typeof indexValue !== 'number' || indexValue < 0 || indexValue >= arrayInfo.arraySize) {
+                this.output.push(`Erro: Índice do array [${indexValue}] fora dos limites para '${arrayName}'. Tamanho: ${arrayInfo.arraySize}.`);
+                console.error(`Erro: Índice do array [${indexValue}] fora dos limites para '${arrayName}'. Tamanho: ${arrayInfo.arraySize}.`);
+                this.isRunning = false; // Halt on out-of-bounds
+                return;
+            }
+
+            const targetAddress = arrayInfo.address + (indexValue * arrayInfo.elementSize);
+            this.memory.memory.set(targetAddress, evaluatedRhsValue);
+
+        } else if (typeof name === 'string') {
+            // Simple variable assignment
+            // Check if RHS is an address-of operation, should be handled by evaluateExpression or setVariable
+            let valueToSet = evaluatedRhsValue;
+            if (typeof value === 'string' && value.startsWith('&')) { // Re-check original RHS for '&'
+                 valueToSet = this.evaluateExpression(value, scope); // Let evaluateExpression handle '&'
+            }
+            this.memory.setVariable(name, valueToSet, scope);
+        } else {
+            this.output.push(`Erro: Lado esquerdo inválido na atribuição: ${JSON.stringify(name)}`);
+            this.isRunning = false;
         }
-        // Se for uma expressão, avalia
-        else if (!this.isLiteral(value)) {
-            evaluatedValue = this.evaluateExpression(value, scope);
-        }
-        
-        this.memory.setVariable(name, evaluatedValue, scope);
     }
 
     /**
@@ -546,51 +690,128 @@ class CExecutor {
         }
         
         // Operações matemáticas básicas
-        const parts = this.parser.parseExpression(expression);
-        
-        // Expressões simples (a operador b)
-        if (parts.length === 3) {
-            const left = this.getExpressionValue(parts[0], scope);
-            const operator = parts[1];
-            const right = this.getExpressionValue(parts[2], scope);
+        const tokens = this.parser.parseExpression(expression); // Now returns a list of tokens/objects
+
+        // This is a placeholder for a more robust expression evaluation (e.g., Shunting-yard)
+        // For now, we'll handle simple cases and array access as a primary value.
+        if (tokens.length === 1) {
+            return this.getExpressionValue(tokens[0], scope);
+        }
+
+        if (tokens.length === 3) {
+            const left = this.getExpressionValue(tokens[0], scope);
+            const operator = tokens[1]; // Should be a string
+            const right = this.getExpressionValue(tokens[2], scope);
             
+            // Ensure left and right are numbers for arithmetic operations
+            // This is a simplification; type checking should be more robust.
+            const numLeft = Number(left);
+            const numRight = Number(right);
+
+            if (isNaN(numLeft) || isNaN(numRight)) {
+                 // Handle specific non-arithmetic cases like string ops or logical ops if any
+                 if (operator === '&&') return (left && right) ? 1 : 0;
+                 if (operator === '||') return (left || right) ? 1 : 0;
+                 // Potentially handle string concatenation if '+' is overloaded, though C doesn't do that for strings.
+                 // For now, if not arithmetic, and not logical, it's an error or unhandled op
+                 this.output.push(`Erro: Operação '${operator}' com operandos não numéricos: ${left}, ${right}`);
+                 this.isRunning = false;
+                 return undefined;
+            }
+
             switch (operator) {
-                case '+': return left + right;
-                case '-': return left - right;
-                case '*': return left * right;
-                case '/': return Math.floor(left / right); // Divisão inteira em C
-                case '%': return left % right;
-                case '<': return left < right ? 1 : 0;
-                case '>': return left > right ? 1 : 0;
-                case '<=': return left <= right ? 1 : 0;
-                case '>=': return left >= right ? 1 : 0;
-                case '==': return left === right ? 1 : 0;
+                case '+': return numLeft + numRight;
+                case '-': return numLeft - numRight;
+                case '*': return numLeft * numRight;
+                case '/': 
+                    if (numRight === 0) {
+                        this.output.push("Erro: Divisão por zero.");
+                        this.isRunning = false;
+                        return undefined;
+                    }
+                    return Math.floor(numLeft / numRight); // Divisão inteira em C
+                case '%': 
+                    if (numRight === 0) {
+                        this.output.push("Erro: Modulo por zero.");
+                        this.isRunning = false;
+                        return undefined;
+                    }
+                    return numLeft % numRight;
+                case '<': return numLeft < numRight ? 1 : 0;
+                case '>': return numLeft > numRight ? 1 : 0;
+                case '<=': return numLeft <= numRight ? 1 : 0;
+                case '>=': return numLeft >= numRight ? 1 : 0;
+                case '==': return left === right ? 1 : 0; // Use original left/right for potential type diffs if not strictly numbers
                 case '!=': return left !== right ? 1 : 0;
-                case '&&': return left && right ? 1 : 0;
-                case '||': return left || right ? 1 : 0;
+                case '&&': return (numLeft && numRight) ? 1 : 0; // Logical ops on numbers (0 is false, non-0 is true)
+                case '||': return (numLeft || numRight) ? 1 : 0;
+                default:
+                     this.output.push(`Erro: Operador desconhecido '${operator}'`);
+                     this.isRunning = false;
+                     return undefined;
             }
         }
         
-        // Se for uma variável simples ou literal
-        return this.getExpressionValue(expression, scope);
+        // Fallback for single token or more complex expressions not handled by 3-part logic
+        if (tokens.length > 0) {
+             return this.getExpressionValue(tokens[0], scope); // Simplistic: evaluate first token only
+        }
+        this.output.push(`Erro: Expressão inválida ou muito complexa para avaliação simplificada: ${expression}`);
+        this.isRunning = false;
+        return undefined; // Should ideally throw or handle error
     }
 
     /**
-     * Obtém o valor de uma parte da expressão
-     * @param {string} expr - Parte da expressão
+     * Obtém o valor de uma parte da expressão (token individual)
+     * @param {string | number | object} token - Parte da expressão (pode ser string, número ou objeto array_access)
      * @param {string} scope - Escopo atual
      * @returns {*} Valor da expressão
      */
-    getExpressionValue(expr, scope) {
-        expr = expr.trim();
-        
-        // Constantes numéricas
-        if (!isNaN(expr)) {
-            return parseFloat(expr);
+    getExpressionValue(token, scope) {
+        if (typeof token === 'number') {
+            return token; // Already a literal number
+        }
+        if (typeof token === 'string') {
+            token = token.trim();
+            // Constantes numéricas (string form)
+            if (!isNaN(token)) {
+                return parseFloat(token);
+            }
+            // String literals (e.g. "text", though C strings are char arrays)
+            if ((token.startsWith('"') && token.endsWith('"')) || (token.startsWith("'") && token.endsWith("'"))) {
+                // For now, returning string literals as is. Printf handles them.
+                // In expressions, they'd typically be addresses of char arrays.
+                return token;
+            }
+            // Simple variable name
+            return this.memory.getVariable(token, scope) ?? 0; // Default to 0 if undefined
+        }
+        if (typeof token === 'object' && token.type === 'array_access') {
+            const arrayName = token.name;
+            const indexExpression = token.indexExpression; // This is a string
+
+            const arrayInfo = this.memory.getVariableInfo(arrayName, scope);
+            if (!arrayInfo || arrayInfo.type !== 'array') {
+                this.output.push(`Erro: '${arrayName}' não é um array ou não foi declarado no escopo '${scope}'.`);
+                console.error(`Erro: '${arrayName}' não é um array ou não foi declarado. arrayInfo:`, arrayInfo);
+                this.isRunning = false;
+                return undefined; // Halt
+            }
+
+            const indexValue = this.evaluateExpression(indexExpression, scope); // Recursive call for index
+            if (typeof indexValue !== 'number' || indexValue < 0 || indexValue >= arrayInfo.arraySize) {
+                this.output.push(`Erro: Índice do array [${indexValue}] fora dos limites para '${arrayName}'. Tamanho: ${arrayInfo.arraySize}.`);
+                console.error(`Erro: Índice do array [${indexValue}] fora dos limites para '${arrayName}'. Tamanho: ${arrayInfo.arraySize}.`);
+                this.isRunning = false; // Halt on out-of-bounds
+                return undefined;
+            }
+            const elementAddress = arrayInfo.address + (indexValue * arrayInfo.elementSize);
+            return this.memory.memory.get(elementAddress);
         }
         
-        // Variáveis
-        return this.memory.getVariable(expr, scope) ?? 0;
+        this.output.push(`Erro: Token de expressão desconhecido: ${JSON.stringify(token)}`);
+        this.isRunning = false;
+        return undefined; // Should throw or handle error
     }
 
     /**
