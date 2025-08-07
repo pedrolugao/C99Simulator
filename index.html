@@ -23,21 +23,20 @@
                 </div>
                 
                 <textarea id="c-code" placeholder="Digite seu código C99 aqui...">
-// Exemplo de código
+// Código de teste para Fibonacci
 #include <stdio.h>
 
-int fatorial(int n) {
+int fib(int n) {
     if (n <= 1) {
-        return 1;
+        return n;
     }
-    return n * fatorial(n - 1);
+    return fib(n - 1) + fib(n - 2);
 }
 
 int main() {
-    int n = 5;
-    int *ptr = &n;
-    int resultado = fatorial(n);
-    printf("Fatorial de %d é %d\n", n, resultado);
+    int n = 7;
+    int resultado = fib(n);
+    printf("Fibonacci de %d é %d\n", n, resultado);
     return 0;
 }
 </textarea>

@@ -16,6 +16,7 @@ class CExecutor {
         this.isRunning = false;
         this.isPaused = false;
         this.completedFrames = []; // Armazenará os frames que foram finalizados
+        this.rpnContextStack = []; // For handling nested function calls in expressions
     }
 
     /**
@@ -278,6 +279,8 @@ class CExecutor {
         this.isRunning = false;
         this.isPaused = false;
         this.completedFrames = []; // Limpa os frames finalizados
+        this.rpnContextStack = [];
+        this.pendingOperation = null;
     }
 
     /**
@@ -384,10 +387,21 @@ class CExecutor {
      */
     executeAssignment(instruction, functionName) {
         const { name, value } = instruction; // 'name' can be a string or an array_access object
-        const scope = functionName === 'global' ? 'global' : functionName;
-        
-        const evaluatedRhsValue = this.evaluateExpression(value, scope);
+        const scope = functionName;
 
+        const result = this.evaluateExpression(value, scope);
+
+        if (result && result.needsFunctionCall) {
+            // A function call is needed. Pause this assignment.
+            this.pendingOperation = { type: 'assignment', name, scope };
+            this.executeFunctionCall(result.functionCall, scope);
+        } else {
+            // The expression was evaluated completely.
+            this.finishAssignment(name, result, scope);
+        }
+    }
+
+    finishAssignment(name, valueToSet, scope) {
         if (typeof name === 'object' && name.type === 'array_access') {
             const arrayName = name.name;
             const indexExpression = name.indexExpression;
@@ -395,7 +409,6 @@ class CExecutor {
             const arrayInfo = this.memory.getVariableInfo(arrayName, scope);
             if (!arrayInfo || arrayInfo.type !== 'array') {
                 this.output.push(`Erro: '${arrayName}' não é um array ou não foi declarado no escopo '${scope}'.`);
-                console.error(`Erro: '${arrayName}' não é um array ou não foi declarado. arrayInfo:`, arrayInfo);
                 this.isRunning = false;
                 return;
             }
@@ -403,21 +416,14 @@ class CExecutor {
             const indexValue = this.evaluateExpression(indexExpression, scope);
             if (typeof indexValue !== 'number' || indexValue < 0 || indexValue >= arrayInfo.arraySize) {
                 this.output.push(`Erro: Índice do array [${indexValue}] fora dos limites para '${arrayName}'. Tamanho: ${arrayInfo.arraySize}.`);
-                console.error(`Erro: Índice do array [${indexValue}] fora dos limites para '${arrayName}'. Tamanho: ${arrayInfo.arraySize}.`);
-                this.isRunning = false; // Halt on out-of-bounds
+                this.isRunning = false;
                 return;
             }
 
             const targetAddress = arrayInfo.address + (indexValue * arrayInfo.elementSize);
-            this.memory.memory.set(targetAddress, evaluatedRhsValue);
+            this.memory.memory.set(targetAddress, valueToSet);
 
         } else if (typeof name === 'string') {
-            // Simple variable assignment
-            // Check if RHS is an address-of operation, should be handled by evaluateExpression or setVariable
-            let valueToSet = evaluatedRhsValue;
-            if (typeof value === 'string' && value.startsWith('&')) { // Re-check original RHS for '&'
-                 valueToSet = this.evaluateExpression(value, scope); // Let evaluateExpression handle '&'
-            }
             this.memory.setVariable(name, valueToSet, scope);
         } else {
             this.output.push(`Erro: Lado esquerdo inválido na atribuição: ${JSON.stringify(name)}`);
@@ -489,66 +495,82 @@ class CExecutor {
      * @param {string} functionName - Nome da função atual
      */
     executeReturn(instruction, functionName) {
-        const { value, isRecursive, recursiveVar, recursiveFunc, recursiveArgs } = instruction;
-        
-        let returnValue;
-        
-        // Caso especial para retorno recursivo (fatorial e similares)
-        if (isRecursive) {
-            // Obtém o valor da variável (por exemplo, n em n * fatorial(n-1))
-            const varValue = this.memory.getVariable(recursiveVar, functionName);
-            
-            // Se já temos um valor de retorno para a chamada recursiva, use-o
-            if (recursiveFunc in this.memory.lastReturnValues) {
-                const recursiveReturnValue = this.memory.lastReturnValues[recursiveFunc];
-                returnValue = varValue * recursiveReturnValue;
-            } else {
-                // Se ainda não temos resultado da chamada recursiva, usa apenas o valor da variável
-                returnValue = varValue;
-            }
-        } else {
-            // Avalia o valor de retorno normal
-            returnValue = value;
-            if (value && !this.isLiteral(value)) {
-                returnValue = this.evaluateExpression(value, functionName);
-            }
-        }
-        
-        // Define o valor de retorno no frame atual
-        this.memory.setReturnValue(returnValue);
-        
-        // Armazena o valor de retorno para a função atual na memória
-        this.memory.lastReturnValues[functionName] = returnValue;
-        
-        // Armazena uma cópia do frame atual antes de removê-lo da pilha
-        const currentFrame = this.memory.getCurrentFrame();
-        if (currentFrame) {
-            // Adiciona à lista de frames completados para visualização
-            this.completedFrames.push({...currentFrame, returnValue});
-        }
-        
-        // Remove o frame atual da pilha
-        this.memory.popStackFrame();
-        
-        // Se estiver retornando da main, finaliza a execução
-        if (functionName === 'main') {
-            this.isRunning = false;
+        const { value } = instruction;
+        const scope = functionName;
+
+        if (!value) { // Handle "return;"
+            this.finishReturn(undefined, functionName);
             return;
         }
-        
-        // Busca o marcador de fim de função
-        let endIndex = this.executionPointer;
-        while (endIndex < this.executionStack.length) {
-            const item = this.executionStack[endIndex];
-            if (item.instruction.type === 'function_end' && item.function === functionName) {
-                break;
-            }
-            endIndex++;
+
+        const result = this.evaluateExpression(value, scope);
+
+        if (result && result.needsFunctionCall) {
+            // A function call is needed. Pause this return.
+            this.pendingOperation = { type: 'return', scope: functionName };
+            this.executeFunctionCall(result.functionCall, scope);
+        } else {
+            // The expression was evaluated completely.
+            this.finishReturn(result, functionName);
         }
-        
-        // Ajusta o ponteiro de execução para o fim da função
-        if (endIndex < this.executionStack.length) {
-            this.executionPointer = endIndex;
+    }
+
+    finishReturn(returnValue, functionName) {
+        // Define o valor de retorno no frame atual
+        this.memory.setReturnValue(returnValue);
+
+        // Check if we are returning to a pending RPN evaluation
+        if (this.rpnContextStack.length > 0) {
+            const context = this.rpnContextStack.pop();
+            context.valueStack.push(returnValue);
+            const result = this.evaluateRPN(context.rpnQueue, context.scope, context.valueStack);
+
+            if (result && result.needsFunctionCall) {
+                this.pendingOperation = this.pendingOperation; // It should still be set
+                this.executeFunctionCall(result.functionCall, context.scope);
+            } else {
+                // RPN evaluation is complete, now complete the original operation
+                if (this.pendingOperation) {
+                    if (this.pendingOperation.type === 'assignment') {
+                        this.finishAssignment(this.pendingOperation.name, result, this.pendingOperation.scope);
+                    } else if (this.pendingOperation.type === 'return') {
+                        this.finishReturn(result, this.pendingOperation.scope);
+                    }
+                    this.pendingOperation = null;
+                }
+            }
+        } else {
+            // Normal return, not from an expression
+            // Armazena uma cópia do frame atual antes de removê-lo da pilha
+            const currentFrame = this.memory.getCurrentFrame();
+            if (currentFrame) {
+                // Adiciona à lista de frames completados para visualização
+                this.completedFrames.push({...currentFrame, returnValue});
+            }
+
+            // Remove o frame atual da pilha
+            this.memory.popStackFrame();
+
+            // Se estiver retornando da main, finaliza a execução
+            if (functionName === 'main') {
+                this.isRunning = false;
+                return;
+            }
+
+            // Busca o marcador de fim de função
+            let endIndex = this.executionPointer;
+            while (endIndex < this.executionStack.length) {
+                const item = this.executionStack[endIndex];
+                if (item.instruction.type === 'function_end' && item.function === functionName) {
+                    break;
+                }
+                endIndex++;
+            }
+
+            // Ajusta o ponteiro de execução para o fim da função
+            if (endIndex < this.executionStack.length) {
+                this.executionPointer = endIndex;
+            }
         }
     }
 
@@ -635,130 +657,73 @@ class CExecutor {
      * @returns {*} Resultado da expressão
      */
     evaluateExpression(expression, scope) {
-        // Verifica se é um operador de endereço
-        if (typeof expression === 'string' && expression.startsWith('&')) {
-            return expression;
-        }
-        
-        // Converte para string se não for
-        if (typeof expression !== 'string') {
-            return expression;
-        }
-        
-        expression = expression.trim();
-        
-        // Processa expressões com chamada de função recursiva
-        // Exemplo: n * fatorial(n-1) ou n * factorial(n-1)
-        const recursivePattern = /(\w+)\s*\*\s*(\w+)\(([^)]+)\)/;
-        const recursiveMatch = expression.match(recursivePattern);
-        
-        if (recursiveMatch) {
-            const varName = recursiveMatch[1]; // n
-            const funcName = recursiveMatch[2]; // fatorial
-            const argExpr = recursiveMatch[3]; // n-1
-            
-            // Este é um caso especial para expressões recursivas como fatorial
-            // Obtém o valor da variável (n neste caso)
-            const varValue = this.memory.getVariable(varName, scope);
-            
-            // Obtém o valor do último retorno desta função (se disponível)
-            let returnValue = 0;
-            if (funcName in this.memory.lastReturnValues) {
-                returnValue = this.memory.lastReturnValues[funcName];
-                
-                // Retorna o cálculo completo: n * (valor retornado pela chamada recursiva)
-                return varValue * returnValue;
+        if (typeof expression !== 'object') {
+            // It's a literal or a simple variable name that wasn't converted to RPN.
+            // This can happen for simple printf arguments, for example.
+            const tokens = this.parser.parseExpression(expression);
+            if (tokens.length === 1) {
+                return this.getExpressionValue(tokens[0], scope);
             }
-            
-            // Se ainda não temos um valor de retorno, um cálculo preciso não é possível
-            // Então apenas avalia um lado da expressão
-            return varValue;
-        }
-        
-        // Chamada de função simples
-        const functionCallMatch = expression.match(/(\w+)\s*\((.*)\)/);
-        if (functionCallMatch) {
-            const functionName = functionCallMatch[1];
-            const argsStr = functionCallMatch[2];
-            
-            // Se já tivermos um valor de retorno para esta função, use-o
-            if (functionName in this.memory.lastReturnValues) {
-                return this.memory.lastReturnValues[functionName];
-            }
-            
-            return 0; // Valor padrão se não conhecemos o resultado
-        }
-        
-        // Operações matemáticas básicas
-        const tokens = this.parser.parseExpression(expression); // Now returns a list of tokens/objects
-
-        // This is a placeholder for a more robust expression evaluation (e.g., Shunting-yard)
-        // For now, we'll handle simple cases and array access as a primary value.
-        if (tokens.length === 1) {
-            return this.getExpressionValue(tokens[0], scope);
         }
 
-        if (tokens.length === 3) {
-            const left = this.getExpressionValue(tokens[0], scope);
-            const operator = tokens[1]; // Should be a string
-            const right = this.getExpressionValue(tokens[2], scope);
-            
-            // Ensure left and right are numbers for arithmetic operations
-            // This is a simplification; type checking should be more robust.
-            const numLeft = Number(left);
-            const numRight = Number(right);
+        // The expression is an RPN queue.
+        return this.evaluateRPN(expression, scope);
+    }
 
-            if (isNaN(numLeft) || isNaN(numRight)) {
-                 // Handle specific non-arithmetic cases like string ops or logical ops if any
-                 if (operator === '&&') return (left && right) ? 1 : 0;
-                 if (operator === '||') return (left || right) ? 1 : 0;
-                 // Potentially handle string concatenation if '+' is overloaded, though C doesn't do that for strings.
-                 // For now, if not arithmetic, and not logical, it's an error or unhandled op
-                 this.output.push(`Erro: Operação '${operator}' com operandos não numéricos: ${left}, ${right}`);
-                 this.isRunning = false;
-                 return undefined;
-            }
+    /**
+     * Avalia uma expressão em notação polonesa reversa (RPN)
+     * @param {Array} rpnQueue - Fila de tokens em RPN
+     * @param {string} scope - Escopo atual
+     * @returns {*} Resultado da expressão
+     */
+    evaluateRPN(rpnQueue, scope, valueStack = []) {
+        for (let i = 0; i < rpnQueue.length; i++) {
+            const token = rpnQueue[i];
 
-            switch (operator) {
-                case '+': return numLeft + numRight;
-                case '-': return numLeft - numRight;
-                case '*': return numLeft * numRight;
-                case '/': 
-                    if (numRight === 0) {
-                        this.output.push("Erro: Divisão por zero.");
+            if (typeof token === 'number' || (typeof token === 'string' && (token.startsWith('"') || token.startsWith("'")))) {
+                valueStack.push(this.getExpressionValue(token, scope));
+            } else if (typeof token === 'string' && /^[a-zA-Z_]\w*$/.test(token)) { // Identifier
+                valueStack.push(this.getExpressionValue(token, scope));
+            } else if (typeof token === 'object' && token.type === 'array_access') {
+                valueStack.push(this.getExpressionValue(token, scope));
+            } else if (typeof token === 'object' && token.type === 'function_call') {
+                // Pause the current evaluation, push the context onto the stack,
+                // and return a special object indicating a function call is needed.
+                this.rpnContextStack.push({
+                    rpnQueue: rpnQueue.slice(i + 1), // The rest of the queue
+                    scope,
+                    valueStack
+                });
+                return { needsFunctionCall: true, functionCall: token };
+            } else { // Operator
+                const right = valueStack.pop();
+                const left = valueStack.pop();
+                const numLeft = Number(left);
+                const numRight = Number(right);
+
+                switch (token) {
+                    case '+': valueStack.push(numLeft + numRight); break;
+                    case '-': valueStack.push(numLeft - numRight); break;
+                    case '*': valueStack.push(numLeft * numRight); break;
+                    case '/': valueStack.push(Math.floor(numLeft / numRight)); break;
+                    case '%': valueStack.push(numLeft % numRight); break;
+                    case '<': valueStack.push(numLeft < numRight ? 1 : 0); break;
+                    case '>': valueStack.push(numLeft > numRight ? 1 : 0); break;
+                    case '<=': valueStack.push(numLeft <= numRight ? 1 : 0); break;
+                    case '>=': valueStack.push(numLeft >= numRight ? 1 : 0); break;
+                    case '==': valueStack.push(left === right ? 1 : 0); break;
+                    case '!=': valueStack.push(left !== right ? 1 : 0); break;
+                    case '&&': valueStack.push((numLeft && numRight) ? 1 : 0); break;
+                    case '||': valueStack.push((numLeft || numRight) ? 1 : 0); break;
+                    default:
+                        this.output.push(`Erro: Operador desconhecido '${token}' na avaliação RPN`);
                         this.isRunning = false;
                         return undefined;
-                    }
-                    return Math.floor(numLeft / numRight); // Divisão inteira em C
-                case '%': 
-                    if (numRight === 0) {
-                        this.output.push("Erro: Modulo por zero.");
-                        this.isRunning = false;
-                        return undefined;
-                    }
-                    return numLeft % numRight;
-                case '<': return numLeft < numRight ? 1 : 0;
-                case '>': return numLeft > numRight ? 1 : 0;
-                case '<=': return numLeft <= numRight ? 1 : 0;
-                case '>=': return numLeft >= numRight ? 1 : 0;
-                case '==': return left === right ? 1 : 0; // Use original left/right for potential type diffs if not strictly numbers
-                case '!=': return left !== right ? 1 : 0;
-                case '&&': return (numLeft && numRight) ? 1 : 0; // Logical ops on numbers (0 is false, non-0 is true)
-                case '||': return (numLeft || numRight) ? 1 : 0;
-                default:
-                     this.output.push(`Erro: Operador desconhecido '${operator}'`);
-                     this.isRunning = false;
-                     return undefined;
+                }
             }
         }
-        
-        // Fallback for single token or more complex expressions not handled by 3-part logic
-        if (tokens.length > 0) {
-             return this.getExpressionValue(tokens[0], scope); // Simplistic: evaluate first token only
-        }
-        this.output.push(`Erro: Expressão inválida ou muito complexa para avaliação simplificada: ${expression}`);
-        this.isRunning = false;
-        return undefined; // Should ideally throw or handle error
+
+        return valueStack.length > 0 ? valueStack[0] : undefined;
     }
 
     /**

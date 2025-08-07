@@ -239,11 +239,13 @@ class CParser {
             if (assignMatch) {
                 const name = assignMatch[1];
                 const value = assignMatch[2];
+                const tokens = this.parseExpression(value);
+                const rpn = this.toRPN(tokens);
                 
                 body.push({
                     type: 'assignment',
                     name,
-                    value
+                    value: rpn
                 });
                 
                 continue;
@@ -267,38 +269,18 @@ class CParser {
                 continue;
             }
             
-            // Retorno com padrão de recursão (n * fatorial(n-1))
-            const recursiveReturnRegex = /^return\s+(\w+)\s*\*\s*(\w+)\s*\((.*)\)$/;
-            const recursiveMatch = recursiveReturnRegex.exec(line);
-            
-            if (recursiveMatch) {
-                const varName = recursiveMatch[1];
-                const funcName = recursiveMatch[2];
-                const argsStr = recursiveMatch[3].trim();
-                
-                // Criamos uma instrução de return específica para recursão
-                body.push({
-                    type: 'return',
-                    value: `${varName} * ${funcName}(${argsStr})`,
-                    isRecursive: true,
-                    recursiveVar: varName,
-                    recursiveFunc: funcName,
-                    recursiveArgs: argsStr ? this.parseArgumentList(argsStr) : []
-                });
-                
-                continue;
-            }
-            
             // Retorno normal
             const returnRegex = /^return\s+(.*)$/;
             const returnMatch = returnRegex.exec(line);
             
             if (returnMatch) {
                 const value = returnMatch[1];
+                const tokens = this.parseExpression(value);
+                const rpn = this.toRPN(tokens);
                 
                 body.push({
                     type: 'return',
-                    value
+                    value: rpn
                 });
                 
                 continue;
@@ -377,6 +359,7 @@ class CParser {
      */
     parseExpression(expr) {
         const tokens = [];
+        const functionCallRegex = /^(\w+)\s*\(([^)]*)\)/;
         const arrayAccessRegex = /^(\w+)\s*\[([^\]]+)\]/;
         const identifierRegex = /^[a-zA-Z_]\w*/;
         const numberRegex = /^\d+\.?\d*|^\.\d+/;
@@ -389,8 +372,17 @@ class CParser {
         while (remainingExpr.length > 0) {
             let match;
 
-            // 1. Array Access
-            if ((match = arrayAccessRegex.exec(remainingExpr))) {
+            // 1. Function Call
+            if ((match = functionCallRegex.exec(remainingExpr))) {
+                tokens.push({
+                    type: "function_call",
+                    name: match[1],
+                    args: this.parseArgumentList(match[2])
+                });
+                remainingExpr = remainingExpr.substring(match[0].length).trim();
+            }
+            // 2. Array Access
+            else if ((match = arrayAccessRegex.exec(remainingExpr))) {
                 tokens.push({
                     type: "array_access",
                     name: match[1],
@@ -398,27 +390,27 @@ class CParser {
                 });
                 remainingExpr = remainingExpr.substring(match[0].length).trim();
             }
-            // 2. String Literals
+            // 3. String Literals
             else if ((match = stringLiteralRegex.exec(remainingExpr))) {
                 tokens.push(match[0]); // Push the full string literal with quotes
                 remainingExpr = remainingExpr.substring(match[0].length).trim();
             }
-            // 3. Identifiers (must come after array access)
+            // 4. Identifiers (must come after array access and function calls)
             else if ((match = identifierRegex.exec(remainingExpr))) {
                 tokens.push(match[0]);
                 remainingExpr = remainingExpr.substring(match[0].length).trim();
             }
-            // 4. Numbers
+            // 5. Numbers
             else if ((match = numberRegex.exec(remainingExpr))) {
                 tokens.push(parseFloat(match[0])); // Store as number
                 remainingExpr = remainingExpr.substring(match[0].length).trim();
             }
-            // 5. Operators
+            // 6. Operators
             else if ((match = operatorRegex.exec(remainingExpr))) {
                 tokens.push(match[0]);
                 remainingExpr = remainingExpr.substring(match[0].length).trim();
             }
-            // 6. Whitespace (if any remains, skip)
+            // 7. Whitespace (if any remains, skip)
             else if (remainingExpr.match(/^\s+/)) {
                 remainingExpr = remainingExpr.replace(/^\s+/, '');
             }
@@ -432,6 +424,47 @@ class CParser {
             }
         }
         return tokens;
+    }
+
+    /**
+     * Converte uma lista de tokens de infixo para notação polonesa reversa (RPN)
+     * @param {Array} tokens - Lista de tokens da expressão
+     * @returns {Array} Fila de saída em RPN
+     */
+    toRPN(tokens) {
+        const outputQueue = [];
+        const operatorStack = [];
+        const precedence = {
+            '*': 3, '/': 3, '%': 3,
+            '+': 2, '-': 2,
+            '<': 1, '>': 1, '<=': 1, '>=': 1, '==': 1, '!=': 1,
+            '&&': 0, '||': 0
+        };
+
+        for (const token of tokens) {
+            if (typeof token === 'number' || (typeof token === 'object' && (token.type === 'array_access' || token.type === 'function_call')) || typeof token === 'string' && /^[a-zA-Z_]\w*$/.test(token)) {
+                outputQueue.push(token);
+            } else if (token in precedence) {
+                while (operatorStack.length > 0 &&
+                       precedence[operatorStack[operatorStack.length - 1]] >= precedence[token]) {
+                    outputQueue.push(operatorStack.pop());
+                }
+                operatorStack.push(token);
+            } else if (token === '(') {
+                operatorStack.push(token);
+            } else if (token === ')') {
+                while (operatorStack.length > 0 && operatorStack[operatorStack.length - 1] !== '(') {
+                    outputQueue.push(operatorStack.pop());
+                }
+                operatorStack.pop(); // Pop '('
+            }
+        }
+
+        while (operatorStack.length > 0) {
+            outputQueue.push(operatorStack.pop());
+        }
+
+        return outputQueue;
     }
 }
 
